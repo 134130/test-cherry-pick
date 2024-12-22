@@ -5,7 +5,7 @@ The repository for integration test of the [gh-cherry-pick](https://github.com/1
 ## Structure
 
 - `main` branch: The main branch of the repository.
-- `release-1.*` branch: The release branch of the repository.
+- `release/1.*` branch: The release branch of the repository.
 - `feature/*` branch: The feature branch of the repository.
 
 ### Pull Requests
