@@ -15,4 +15,4 @@ The repository for integration test of the [gh-cherry-pick](https://github.com/1
 - **[#3](https://github.com/134130/test-cherry-pick/pull/3)** : The PR in draft mode.
 - **[#4](https://github.com/134130/test-cherry-pick/pull/4)** : The PR merged with `Squash and merge` option.
 - **[#5](https://github.com/134130/test-cherry-pick/pull/5)** : The PR merged with `Rebase and merge` option.
-- **[#6](https://github.com/134130/test-cherry-pick/pull/6)** : The PR's merge commit will be conflict with the `release/1.0` branch.
+- **[#7](https://github.com/134130/test-cherry-pick/pull/7)** : The PR's merge commit will be conflict with the `release/1.0` branch.
