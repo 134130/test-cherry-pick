@@ -1,0 +1,475 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+REMOTE="${REMOTE:-origin}"
+DEFAULT_BRANCH="${DEFAULT_BRANCH:-main}"
+RUN_ID="${CHERRY_PICK_RUN_ID:-$(date +%Y%m%d%H%M%S)}"
+BRANCH_PREFIX="${CHERRY_PICK_BRANCH_PREFIX:-}"
+RESET_BRANCH="${CHERRY_PICK_RESET_BRANCH:-test-cherry-pick-reset}"
+SCENARIO="${1:-basic}"
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+MANIFEST_FILE="${TMPDIR:-/tmp}/test-cherry-pick-manifest-${RUN_ID}-$$.tsv"
+PRESERVE_DIR=""
+
+cd "$REPO_ROOT"
+
+cleanup() {
+  if [[ -n "$PRESERVE_DIR" ]]; then
+    rm -rf "$PRESERVE_DIR"
+  fi
+}
+trap cleanup EXIT
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./init [basic|methods|conflict|blocked|all]
+
+Scenarios:
+  basic     One successful current-branch apply fixture.
+  methods   Squash, rebase, merge-commit, and multi-commit fixtures.
+  conflict  Target branch that conflicts with a merged PR.
+  blocked   Open PR fixture for blocked-plan behavior.
+  all       Build every scenario in one repository reset.
+
+Environment:
+  REMOTE                      Git remote to push to. Defaults to origin.
+  DEFAULT_BRANCH              Default branch to reset and target. Defaults to main.
+  CHERRY_PICK_RUN_ID          Manifest suffix. Defaults to timestamp.
+  CHERRY_PICK_BRANCH_PREFIX   Optional branch prefix override. When set,
+                              generated branches use
+                              ${CHERRY_PICK_BRANCH_PREFIX}-case-<logical-id>
+                              and
+                              ${CHERRY_PICK_BRANCH_PREFIX}-target-<logical-id>.
+EOF
+}
+
+log() {
+  printf '==> %s\n' "$*"
+}
+
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+branch_for() {
+  local id="$1"
+
+  if [[ -n "$BRANCH_PREFIX" ]]; then
+    printf '%s-case-%s' "$BRANCH_PREFIX" "$id"
+    return
+  fi
+
+  printf 'case-%s' "$id"
+}
+
+target_for() {
+  local id="$1"
+
+  if [[ -n "$BRANCH_PREFIX" ]]; then
+    printf '%s-target-%s' "$BRANCH_PREFIX" "$id"
+    return
+  fi
+
+  printf 'target-%s' "$id"
+}
+
+is_fixture_branch() {
+  local branch="$1"
+
+  if [[ -n "$BRANCH_PREFIX" && "$branch" == "$BRANCH_PREFIX-"* ]]; then
+    return 0
+  fi
+
+  case "$branch" in
+  case-* | target-* | cherry-* | fixture-* | pr-* | release/*)
+    return 0
+    ;;
+  esac
+
+  return 1
+}
+
+record_manifest() {
+  local id="$1"
+  local method="$2"
+  local source_branch="$3"
+  local target_branch="$4"
+  local url="$5"
+  local expected="$6"
+
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$id" "$method" "$source_branch" "$target_branch" "$url" "$expected" >>"$MANIFEST_FILE"
+}
+
+print_manifest() {
+  printf '\nFixture manifest\n'
+  printf '  scenario: %s\n' "$SCENARIO"
+  if [[ -n "$BRANCH_PREFIX" ]]; then
+    printf '  branch naming: %s-case/<target>-<logical-id>\n\n' "$BRANCH_PREFIX"
+  else
+    printf '  branch naming: readable defaults (case-*/target-*)\n\n'
+  fi
+
+  if [[ ! -s "$MANIFEST_FILE" ]]; then
+    printf '  No PRs created.\n'
+    return
+  fi
+
+  while IFS=$'\t' read -r id method source_branch target_branch url expected; do
+    printf '  %-9s method=%-7s source=%-28s target=%-28s %s\n' \
+      "$id" "$method" "$source_branch" "$target_branch" "$url"
+    printf '            expected: %s\n' "$expected"
+  done <"$MANIFEST_FILE"
+}
+
+require_tools() {
+  command -v git >/dev/null || die "git is required"
+  command -v gh >/dev/null || die "GitHub CLI (gh) is required"
+}
+
+validate_scenario() {
+  case "$SCENARIO" in
+  basic | methods | conflict | blocked | all)
+    return 0
+    ;;
+  *)
+    usage
+    die "unknown scenario: $SCENARIO"
+    ;;
+  esac
+}
+
+require_safe_worktree() {
+  local dirty=0
+  local line
+  local path
+
+  while IFS= read -r line; do
+    path="${line:3}"
+    case "$path" in
+    README.md | init)
+      ;;
+    *)
+      printf 'dirty path blocks fixture reset: %s\n' "$line" >&2
+      dirty=1
+      ;;
+    esac
+  done < <(git status --porcelain)
+
+  if [[ "$dirty" -ne 0 ]]; then
+    die "commit, stash, or remove non-fixture changes before running ./init"
+  fi
+}
+
+preserve_baseline_files() {
+  PRESERVE_DIR="$(mktemp -d)"
+
+  cp README.md "$PRESERVE_DIR/README.md"
+  cp "$SCRIPT_PATH" "$PRESERVE_DIR/init"
+  chmod +x "$PRESERVE_DIR/init"
+}
+
+close_fixture_prs() {
+  local number
+  local head
+
+  log "Closing open fixture PRs"
+  gh pr list --state open --limit 300 --json number,headRefName \
+    --jq '.[] | [.number, .headRefName] | @tsv' |
+    while IFS=$'\t' read -r number head; do
+      [[ -z "$number" || -z "$head" ]] && continue
+      if is_fixture_branch "$head"; then
+        gh pr close "$number" --delete-branch || true
+      fi
+    done
+}
+
+delete_local_fixture_branches() {
+  local branch
+
+  log "Deleting local fixture branches"
+  git for-each-ref --format='%(refname:short)' refs/heads |
+    while IFS= read -r branch; do
+      [[ -z "$branch" ]] && continue
+      if is_fixture_branch "$branch"; then
+        git branch -D "$branch" || true
+      fi
+    done
+}
+
+delete_remote_fixture_branches() {
+  local ref
+  local branch
+
+  log "Deleting remote fixture branches"
+  git ls-remote --heads "$REMOTE" |
+    while IFS=$'\t' read -r _ ref; do
+      branch="${ref#refs/heads/}"
+      [[ -z "$branch" ]] && continue
+      if is_fixture_branch "$branch"; then
+        git push "$REMOTE" ":$branch" || true
+      fi
+    done
+}
+
+switch_default_branch() {
+  if git switch "$DEFAULT_BRANCH" >/dev/null 2>&1; then
+    return
+  fi
+  git switch -c "$DEFAULT_BRANCH" "$REMOTE/$DEFAULT_BRANCH"
+}
+
+reset_fixture_refs() {
+  git fetch "$REMOTE" --prune
+  switch_default_branch
+  close_fixture_prs
+  delete_local_fixture_branches
+  delete_remote_fixture_branches
+}
+
+clear_worktree_except_git() {
+  local path
+
+  shopt -s dotglob nullglob
+  for path in *; do
+    [[ "$path" == ".git" ]] && continue
+    rm -rf -- "$path"
+  done
+  shopt -u dotglob nullglob
+}
+
+reset_main() {
+  local reset_branch="$RESET_BRANCH"
+
+  log "Resetting $DEFAULT_BRANCH to a fresh fixture root"
+  git reset --hard HEAD >/dev/null
+  git clean -fdx >/dev/null
+  git branch -D "$reset_branch" >/dev/null 2>&1 || true
+  git switch --orphan "$reset_branch"
+  git rm -r --cached . >/dev/null 2>&1 || true
+  clear_worktree_except_git
+  cp "$PRESERVE_DIR/README.md" README.md
+  cp "$PRESERVE_DIR/init" init
+  chmod +x init
+  git add README.md init
+  git commit -m "Reset test-cherry-pick fixture baseline"
+  git branch -M "$DEFAULT_BRANCH"
+  git push -u "$REMOTE" "$DEFAULT_BRANCH" -f
+}
+
+commit_file() {
+  local file="$1"
+  local content="$2"
+  local message="$3"
+
+  mkdir -p "$(dirname "$file")"
+  printf '%s\n' "$content" >"$file"
+  git add "$file"
+  git commit -m "$message"
+}
+
+push_branch() {
+  local branch="$1"
+  git push -u "$REMOTE" "$branch" -f
+}
+
+create_target() {
+  local id="$1"
+  local branch
+
+  branch="$(target_for "$id")"
+  log "Creating target [$id] $branch from $DEFAULT_BRANCH"
+  git switch -C "$branch" "$DEFAULT_BRANCH"
+  push_branch "$branch"
+}
+
+open_pr() {
+  local id="$1"
+  local method="$2"
+  local title="$3"
+  local expected="$4"
+  local source_branch
+  local target_branch
+  local body
+  local url
+
+  source_branch="$(branch_for "$id")"
+  target_branch="$(target_for "$id")"
+  body="$(printf 'Fixture scenario: %s\nLogical id: %s\nDemo target: %s\nExpected: %s\n' \
+    "$SCENARIO" "$id" "$target_branch" "$expected")"
+
+  url="$(gh pr create --base "$DEFAULT_BRANCH" --head "$source_branch" --title "[$id] $title" --body "$body")"
+  record_manifest "$id" "$method" "$source_branch" "$target_branch" "$url" "$expected"
+}
+
+create_one_commit_pr() {
+  local id="$1"
+  local method="$2"
+  local title="$3"
+  local file="$4"
+  local content="$5"
+  local expected="$6"
+  local branch
+
+  create_target "$id"
+  branch="$(branch_for "$id")"
+  log "Creating source [$id] $branch -> $DEFAULT_BRANCH"
+  git switch -C "$branch" "$DEFAULT_BRANCH"
+  commit_file "$file" "$content" "[$id] $title"
+  push_branch "$branch"
+  open_pr "$id" "$method" "$title" "$expected"
+}
+
+create_two_commit_pr() {
+  local id="$1"
+  local method="$2"
+  local title="$3"
+  local first_file="$4"
+  local first_content="$5"
+  local second_file="$6"
+  local second_content="$7"
+  local expected="$8"
+  local branch
+
+  create_target "$id"
+  branch="$(branch_for "$id")"
+  log "Creating source [$id] $branch -> $DEFAULT_BRANCH"
+  git switch -C "$branch" "$DEFAULT_BRANCH"
+  commit_file "$first_file" "$first_content" "[$id] $title part 1"
+  commit_file "$second_file" "$second_content" "[$id] $title part 2"
+  push_branch "$branch"
+  open_pr "$id" "$method" "$title" "$expected"
+}
+
+merge_fixture_pr() {
+  local id="$1"
+  local method="$2"
+  local branch
+
+  branch="$(branch_for "$id")"
+  log "Merging [$id] with $method"
+  case "$method" in
+  merge)
+    gh pr merge "$branch" --merge --subject "[$id] merge fixture" --body "Fixture merge commit"
+    ;;
+  squash)
+    gh pr merge "$branch" --squash --subject "[$id] squash fixture" --body "Fixture squash merge"
+    ;;
+  rebase)
+    gh pr merge "$branch" --rebase
+    ;;
+  *)
+    die "unsupported merge method: $method"
+    ;;
+  esac
+
+  git switch "$DEFAULT_BRANCH"
+  git pull --ff-only "$REMOTE" "$DEFAULT_BRANCH"
+}
+
+create_basic() {
+  create_one_commit_pr basic squash "basic current branch apply" fixtures/basic/basic.txt \
+    "basic change" "applies cleanly to target-basic and keeps the current branch"
+  merge_fixture_pr basic squash
+}
+
+create_methods() {
+  create_one_commit_pr squash squash "squash merged change" fixtures/methods/squash.txt \
+    "squash change" "auto method should resolve to squash"
+  merge_fixture_pr squash squash
+
+  create_two_commit_pr rebase rebase "rebase merged change" \
+    fixtures/methods/rebase-one.txt "rebase change one" \
+    fixtures/methods/rebase-two.txt "rebase change two" \
+    "auto method should resolve to patch"
+  merge_fixture_pr rebase rebase
+
+  create_one_commit_pr merge merge "merge commit change" fixtures/methods/merge.txt \
+    "merge change" "auto method should resolve to merge"
+  merge_fixture_pr merge merge
+
+  create_two_commit_pr multi commits "multi commit explicit cherry-pick" \
+    fixtures/methods/multi-one.txt "multi change one" \
+    fixtures/methods/multi-two.txt "multi change two" \
+    "explicit --method commits should cherry-pick commits in order"
+  merge_fixture_pr multi squash
+}
+
+create_conflict() {
+  local target_branch
+  local source_branch
+  local expected
+
+  log "Preparing conflict base on $DEFAULT_BRANCH"
+  git switch "$DEFAULT_BRANCH"
+  commit_file fixtures/conflict/shared.txt "base line" "[conflict] base line"
+  git push "$REMOTE" "$DEFAULT_BRANCH"
+
+  target_branch="$(target_for conflict)"
+  log "Creating conflicting target $target_branch"
+  git switch -C "$target_branch" "$DEFAULT_BRANCH"
+  commit_file fixtures/conflict/shared.txt "target line" "[conflict] target line"
+  push_branch "$target_branch"
+
+  source_branch="$(branch_for conflict)"
+  expected="applying this PR to target-conflict should leave a native conflict"
+  log "Creating source [conflict] $source_branch -> $DEFAULT_BRANCH"
+  git switch -C "$source_branch" "$DEFAULT_BRANCH"
+  commit_file fixtures/conflict/shared.txt "source line" "[conflict] source line"
+  push_branch "$source_branch"
+  open_pr conflict squash "conflicting squash change" "$expected"
+  merge_fixture_pr conflict squash
+}
+
+create_blocked() {
+  create_one_commit_pr open open "open PR should be blocked" fixtures/blocked/open.txt \
+    "open change" "planner should block because the PR is not merged"
+}
+
+run_scenario() {
+  case "$SCENARIO" in
+  basic)
+    create_basic
+    ;;
+  methods)
+    create_methods
+    ;;
+  conflict)
+    create_conflict
+    ;;
+  blocked)
+    create_blocked
+    ;;
+  all)
+    create_basic
+    create_methods
+    create_conflict
+    create_blocked
+    ;;
+  esac
+}
+
+main() {
+  case "$SCENARIO" in
+  -h | --help | help)
+    usage
+    return 0
+    ;;
+  esac
+
+  validate_scenario
+  require_tools
+  require_safe_worktree
+  preserve_baseline_files
+  reset_fixture_refs
+  reset_main
+  run_scenario
+  git switch "$DEFAULT_BRANCH" >/dev/null
+  print_manifest
+}
+
+main "$@"
